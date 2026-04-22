@@ -1,0 +1,1508 @@
+name: VNC Data Static Timeout
+on:
+  workflow_dispatch:
+    inputs:
+      base64_config:
+        description: 'Base64 encoded JSON configuration'
+        required: true
+        type: string
+
+env:
+  DISPLAY: :1
+  VNC_PORT: 5901
+  NOVNC_PORT: 6080
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 380
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch and Parse Config
+        id: config
+        run: |
+          # Decode base64 config (without echoing it)
+          CONFIG=$(echo "${{ inputs.base64_config }}" | base64 -d)
+          
+          # Parse VNC, Cloudflare, and Webshare values (lowercase keys)
+          VNC_ENABLED=$(echo "$CONFIG" | jq -r '.vnc_enabled // "false"')
+          CLOUDFLARE_ENABLED=$(echo "$CONFIG" | jq -r '.cloudflare_enabled // "false"')
+          WEBSHARE_ENABLED=$(echo "$CONFIG" | jq -r '.webshare_enabled // "false"')
+          echo "vnc_enabled=$VNC_ENABLED" >> $GITHUB_OUTPUT
+          echo "cloudflare_enabled=$CLOUDFLARE_ENABLED" >> $GITHUB_OUTPUT
+          echo "webshare_enabled=$WEBSHARE_ENABLED" >> $GITHUB_OUTPUT
+          
+          # Parse user_id and workspace_id with defaults
+          USER_ID=$(echo "$CONFIG" | jq -r '.user_id // "69c3090b-464d-4de3-9358-ceca1c9e2aa8"')
+          WORKSPACE_ID=$(echo "$CONFIG" | jq -r '.workspace_id // "ceae1caa-1538-4859-8e1a-24a8b4904d5f"')
+          echo "user_id=$USER_ID" >> $GITHUB_OUTPUT
+          echo "workspace_id=$WORKSPACE_ID" >> $GITHUB_OUTPUT
+          
+          # Parse VNC password if VNC is enabled
+          if [ "$VNC_ENABLED" = "true" ]; then
+            VNC_PASSWORD=$(echo "$CONFIG" | jq -r '.vnc_password // ""')
+            echo "vnc_password=$VNC_PASSWORD" >> $GITHUB_OUTPUT
+          fi
+          
+          # Parse Cloudflare-related values if Cloudflare is enabled
+          if [ "$CLOUDFLARE_ENABLED" = "true" ]; then
+            CLOUDFLARE_API_TOKEN=$(echo "$CONFIG" | jq -r '.cloudflare_api_token // ""')
+            CLOUDFLARE_ACCOUNT_ID=$(echo "$CONFIG" | jq -r '.cloudflare_account_id // ""')
+            CLOUDFLARE_ZONE_ID=$(echo "$CONFIG" | jq -r '.cloudflare_zone_id // ""')
+            HOSTNAME=$(echo "$CONFIG" | jq -r '.hostname // ""')
+            # Extract browser_profile_id from hostname (UUID prefix before first dot)
+            # e.g. "a6b83dc3-1881-4285-957f-3c49c7b162ad.articleinnovator.com" -> "a6b83dc3-1881-4285-957f-3c49c7b162ad"
+            BROWSER_PROFILE_ID=$(echo "$HOSTNAME" | cut -d'.' -f1)
+            CLOUDFLARE_TUNNEL_CREDENTIAL_ID=$(echo "$CONFIG" | jq -r '.cloudflare_tunnel_credential_id // ""')
+
+            echo "cloudflare_api_token=$CLOUDFLARE_API_TOKEN" >> $GITHUB_OUTPUT
+            echo "cloudflare_account_id=$CLOUDFLARE_ACCOUNT_ID" >> $GITHUB_OUTPUT
+            echo "cloudflare_zone_id=$CLOUDFLARE_ZONE_ID" >> $GITHUB_OUTPUT
+            echo "hostname=$HOSTNAME" >> $GITHUB_OUTPUT
+            echo "browser_profile_id=$BROWSER_PROFILE_ID" >> $GITHUB_OUTPUT
+            echo "cloudflare_tunnel_credential_id=$CLOUDFLARE_TUNNEL_CREDENTIAL_ID" >> $GITHUB_OUTPUT
+
+            echo "✅ Cloudflare Config Loaded"
+            echo "  Hostname: $HOSTNAME"
+            echo "  Browser Profile ID: $BROWSER_PROFILE_ID"
+          fi
+          
+          # Parse Wasabi S3
+          #credentials for browser profile persistence
+          WASABI_ACCESS_KEY=$(echo "$CONFIG" | jq -r '.wasabi_access_key // ""')
+          WASABI_SECRET_KEY=$(echo "$CONFIG" | jq -r '.wasabi_secret_key // ""')
+          WASABI_BUCKET=$(echo "$CONFIG" | jq -r '.wasabi_bucket // ""')
+          WASABI_ENDPOINT=$(echo "$CONFIG" | jq -r '.wasabi_endpoint // "https://s3.wasabisys.com"')
+          WASABI_REGION=$(echo "$CONFIG" | jq -r '.wasabi_region // "us-east-1"')
+          echo "wasabi_access_key=$WASABI_ACCESS_KEY" >> $GITHUB_OUTPUT
+          echo "wasabi_secret_key=$WASABI_SECRET_KEY" >> $GITHUB_OUTPUT
+          echo "wasabi_bucket=$WASABI_BUCKET" >> $GITHUB_OUTPUT
+          echo "wasabi_endpoint=$WASABI_ENDPOINT" >> $GITHUB_OUTPUT
+          echo "wasabi_region=$WASABI_REGION" >> $GITHUB_OUTPUT
+
+          if [ -n "$WASABI_ACCESS_KEY" ] && [ "$WASABI_ACCESS_KEY" != "" ]; then
+            echo "✅ Wasabi Config Loaded (Bucket: $WASABI_BUCKET)"
+          fi
+
+          # Parse proxy configuration from browser profile
+          PROXY_HOST=$(echo "$CONFIG" | jq -r '.proxy.host // ""')
+          PROXY_PORT=$(echo "$CONFIG" | jq -r '.proxy.port // ""')
+          PROXY_TYPE=$(echo "$CONFIG" | jq -r '.proxy.type // "http"')
+          echo "proxy_host=$PROXY_HOST" >> $GITHUB_OUTPUT
+          echo "proxy_port=$PROXY_PORT" >> $GITHUB_OUTPUT
+          echo "proxy_type=$PROXY_TYPE" >> $GITHUB_OUTPUT
+
+          if [ -n "$PROXY_HOST" ] && [ "$PROXY_HOST" != "" ]; then
+            echo "✅ Proxy Config Loaded (${PROXY_TYPE}://${PROXY_HOST}:${PROXY_PORT})"
+          fi
+
+          # Parse Webshare-related values if Webshare is enabled
+          if [ "$WEBSHARE_ENABLED" = "true" ]; then
+            WEBSHARE_API_TOKEN=$(echo "$CONFIG" | jq -r '.webshare_api_token // ""')
+            echo "webshare_api_token=$WEBSHARE_API_TOKEN" >> $GITHUB_OUTPUT
+
+            echo "✅ Webshare Config Loaded"
+          fi
+
+          # Parse Tailscale config
+          TAILSCALE_API_KEY=$(echo "$CONFIG" | jq -r '.tailscale_api_key // ""')
+          TAILSCALE_TOKEN=$(echo "$CONFIG" | jq -r '.tailscale_token // ""')
+          echo "tailscale_api_key=$TAILSCALE_API_KEY" >> $GITHUB_OUTPUT
+          echo "tailscale_token=$TAILSCALE_TOKEN" >> $GITHUB_OUTPUT
+
+          if [ -n "$TAILSCALE_API_KEY" ] && [ "$TAILSCALE_API_KEY" != "" ]; then
+            echo "✅ Tailscale Config Loaded"
+          fi
+
+          # Parse optional workflow_ids for auto-task dispatch (JSON array)
+          WORKFLOW_IDS=$(echo "$CONFIG" | jq -c '.workflow_ids // []')
+          echo "workflow_ids=$WORKFLOW_IDS" >> $GITHUB_OUTPUT
+
+          # Parse profile timeout (minutes), default 45 min, max 360 min (6 hours)
+          PROFILE_TIMEOUT_MINUTES=$(echo "$CONFIG" | jq -r '.profile_timeout_minutes // "45"')
+          # Clamp to valid range (5-360 minutes)
+          if [ "$PROFILE_TIMEOUT_MINUTES" -lt 5 ] 2>/dev/null; then PROFILE_TIMEOUT_MINUTES=5; fi
+          if [ "$PROFILE_TIMEOUT_MINUTES" -gt 360 ] 2>/dev/null; then PROFILE_TIMEOUT_MINUTES=360; fi
+          PROFILE_TIMEOUT_SECONDS=$((PROFILE_TIMEOUT_MINUTES * 60))
+          echo "profile_timeout_minutes=$PROFILE_TIMEOUT_MINUTES" >> $GITHUB_OUTPUT
+          echo "profile_timeout_seconds=$PROFILE_TIMEOUT_SECONDS" >> $GITHUB_OUTPUT
+
+          echo "✅ Config Loaded:"
+          echo "  VNC: $VNC_ENABLED"
+          echo "  Cloudflare: $CLOUDFLARE_ENABLED"
+          echo "  Webshare: $WEBSHARE_ENABLED"
+          echo "  User ID: $USER_ID"
+          echo "  Workspace ID: $WORKSPACE_ID"
+          echo "  Profile Timeout: ${PROFILE_TIMEOUT_MINUTES} min"
+
+      - name: Optimize APT Mirror and Network
+        if: steps.config.outputs.vnc_enabled == 'true'
+        timeout-minutes: 3
+        run: |
+          echo "Optimizing APT mirror and network settings..."
+
+          # Release possible dpkg lock holders on fresh runners
+          sudo systemctl stop unattended-upgrades 2>/dev/null || true
+          sudo killall -9 unattended-upgrades 2>/dev/null || true
+
+          # Add resilient APT networking defaults for CI
+          cat << 'EOF' | sudo tee /etc/apt/apt.conf.d/99ci-network >/dev/null
+          Acquire::Retries "6";
+          APT::Acquire::Retries "6";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          Acquire::http::Pipeline-Depth "0";
+          Acquire::ForceIPv4 "true";
+          Acquire::PDiffs "false";
+          EOF
+
+          # Ubuntu 24.04 runners usually use ubuntu.sources; switch away from Azure mirror.
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list.d/ubuntu.sources
+            sudo sed -i 's|https://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list.d/ubuntu.sources
+          fi
+
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list
+            sudo sed -i 's|https://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list
+          fi
+
+          sudo apt-get -o Acquire::Retries=6 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update -q
+          echo "✅ APT optimization complete"
+
+      - name: Restore Cached Dependencies
+        if: steps.config.outputs.vnc_enabled == 'true'
+        uses: actions/cache@v4
+        id: deps-cache
+        with:
+          path: |
+            ~/cached-debs
+            ~/noVNC
+            ~/.cache/pip
+          key: vnc-deps-v5-${{ runner.os }}
+          restore-keys: |
+            vnc-deps-v5-
+
+      - name: Register IP with Webshare
+        if: steps.config.outputs.webshare_enabled == 'true'
+        id: webshare
+        timeout-minutes: 2
+        run: |
+          echo "Registering IP with Webshare..."
+
+          # Get current public IP (with timeout and retry)
+          PUBLIC_IP=""
+          for attempt in 1 2 3; do
+            PUBLIC_IP=$(curl -s --connect-timeout 10 --max-time 15 'https://api.ipify.org?format=json' | jq -r '.ip // empty')
+            if [ -n "$PUBLIC_IP" ]; then
+              break
+            fi
+            echo "Retrying IP fetch... ($attempt/3)"
+            sleep 2
+          done
+
+          if [ -z "$PUBLIC_IP" ]; then
+            echo "⚠️ Failed to get public IP, skipping Webshare registration"
+            exit 0
+          fi
+          echo "Public IP: $PUBLIC_IP"
+
+          # Register IP with Webshare
+          RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+            "https://proxy.webshare.io/api/v2/proxy/ipauthorization/?plan_id=12984667" \
+            -X POST \
+            -d "{\"ip_address\": \"$PUBLIC_IP\"}" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Token ${{ steps.config.outputs.webshare_api_token }}")
+
+          # Extract authorization ID
+          AUTH_ID=$(echo "$RESPONSE" | jq -r '.id // empty')
+
+          if [ -n "$AUTH_ID" ]; then
+            echo "webshare_auth_id=$AUTH_ID" >> $GITHUB_OUTPUT
+            echo "✅ IP registered with Webshare (Auth ID: $AUTH_ID)"
+          else
+            echo "⚠️ Failed to register IP with Webshare"
+            echo "$RESPONSE" | jq '.'
+          fi
+
+      
+      - name: Install Desktop Environment
+        if: steps.config.outputs.vnc_enabled == 'true' && steps.deps-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 18
+        run: |
+          echo "Installing XFCE desktop environment..."
+
+          install_desktop() {
+            # Kill unattended-upgrades to prevent dpkg lock contention
+            sudo systemctl stop unattended-upgrades 2>/dev/null || true
+            sudo killall -9 unattended-upgrades 2>/dev/null || true
+            sudo killall -9 dpkg 2>/dev/null || true
+
+            # Clean up any broken dpkg state
+            sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true
+            sudo dpkg --configure -a 2>/dev/null || true
+
+            # Wait for any existing dpkg lock to release (max 60s)
+            for i in $(seq 1 12); do
+              if ! sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+                break
+              fi
+              echo "Waiting for dpkg lock to release... ($i/12)"
+              sleep 5
+            done
+
+            # Enable parallel downloads
+            echo 'Acquire::Queue-Mode "access";' | sudo tee /etc/apt/apt.conf.d/99parallel
+            echo 'APT::Acquire::Retries "3";' | sudo tee -a /etc/apt/apt.conf.d/99parallel
+
+            # Ubuntu 24.04 runners may use ubuntu.sources instead of sources.list.
+            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list.d/ubuntu.sources
+              sudo sed -i 's|https://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list.d/ubuntu.sources
+            fi
+
+            # Use standard Ubuntu archive instead of Azure mirror
+            if [ -f /etc/apt/sources.list ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list
+              sudo sed -i 's|https://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list
+            fi
+
+            sudo apt-get -o Acquire::Retries=6 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update -q
+
+            # Create cached-debs directory for parallel downloads
+            mkdir -p ~/cached-debs
+
+            # Start parallel downloads in background
+            echo "📥 Starting parallel downloads..."
+            (wget -q -O ~/cached-debs/google-chrome-stable_current_amd64.deb \
+              https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && echo "✅ Chrome downloaded") &
+            PID_CHROME=$!
+
+            (wget -q -O ~/cached-debs/turbovnc_2.2.5_amd64.deb \
+              https://phoenixnap.dl.sourceforge.net/project/turbovnc/2.2.5/turbovnc_2.2.5_amd64.deb && echo "✅ TurboVNC downloaded") &
+            PID_VNC=$!
+
+            (cd ~ && git clone --depth 1 https://github.com/novnc/noVNC.git && \
+              cd noVNC && git clone --depth 1 https://github.com/novnc/websockify.git && echo "✅ noVNC cloned") &
+            PID_NOVNC=$!
+
+            # Install XFCE while downloads happen in parallel
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              -o Dpkg::Options::="--force-confdef" \
+              -o Dpkg::Options::="--force-confold" \
+              xfce4 \
+              xfce4-terminal \
+              dbus-x11 \
+              x11-utils \
+              x11-xserver-utils \
+              xfonts-base \
+              ffmpeg \
+              wmctrl \
+              python3 \
+              python3-venv
+
+            echo "✅ XFCE installed"
+
+            # Wait for downloads and install
+            wait $PID_CHROME && sudo dpkg -i ~/cached-debs/google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
+            echo "✅ Chrome installed"
+
+            wait $PID_VNC && sudo dpkg -i ~/cached-debs/turbovnc_2.2.5_amd64.deb
+            echo "✅ TurboVNC installed"
+
+            wait $PID_NOVNC
+            echo "✅ noVNC ready"
+          }
+
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          INSTALL_SUCCESS=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "📦 Installation attempt $RETRY_COUNT/$MAX_RETRIES..."
+
+            # Run installation with 5 minute timeout per attempt
+            if timeout 300 bash -c "$(declare -f install_desktop); install_desktop"; then
+              INSTALL_SUCCESS=true
+              break
+            else
+              echo "⚠️ Installation attempt $RETRY_COUNT failed"
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "🔄 Retrying in 30 seconds..."
+                sleep 30
+              fi
+            fi
+          done
+
+          if [ "$INSTALL_SUCCESS" = "true" ]; then
+            echo "✅ All dependencies installed"
+          else
+            echo "❌ Failed to install dependencies after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+      - name: Install from Cache (Fast Path)
+        if: steps.config.outputs.vnc_enabled == 'true' && steps.deps-cache.outputs.cache-hit == 'true'
+        run: |
+          echo "📦 Installing from cache (fast path)..."
+
+          # Kill unattended-upgrades
+          sudo systemctl stop unattended-upgrades 2>/dev/null || true
+          sudo killall -9 unattended-upgrades 2>/dev/null || true
+
+          # Wait for dpkg lock
+          for i in $(seq 1 6); do
+            if ! sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+              break
+            fi
+            echo "Waiting for dpkg lock... ($i/6)"
+            sleep 5
+          done
+
+          # Install XFCE if not already installed
+          if ! command -v startxfce4 &> /dev/null; then
+            sudo apt-get -o Acquire::Retries=6 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update -q
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              xfce4 xfce4-terminal dbus-x11 x11-utils x11-xserver-utils xfonts-base ffmpeg wmctrl python3 python3-venv
+          fi
+
+          # Install cached debs
+          if [ -f ~/cached-debs/google-chrome-stable_current_amd64.deb ] && ! command -v google-chrome &> /dev/null; then
+            sudo dpkg -i ~/cached-debs/google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
+          fi
+
+          if [ -f ~/cached-debs/turbovnc_2.2.5_amd64.deb ] && [ ! -x /opt/TurboVNC/bin/vncserver ]; then
+            sudo dpkg -i ~/cached-debs/turbovnc_2.2.5_amd64.deb
+          fi
+
+          echo "✅ Cache-based installation complete"
+
+      - name: Install and Start Docker
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Setting up Docker..."
+
+          # Docker is pre-installed on ubuntu-latest, just ensure the service is running
+          if command -v docker &> /dev/null; then
+            echo "Docker already installed: $(docker --version)"
+          else
+            echo "Installing Docker..."
+            curl -fsSL https://get.docker.com | sudo sh
+          fi
+
+          # Ensure Docker service is running
+          sudo systemctl start docker 2>/dev/null || sudo dockerd &
+          sleep 3
+
+          # Add current user to docker group so commands work without sudo
+          sudo usermod -aG docker $USER
+
+          # Install docker compose plugin if not present
+          if ! docker compose version &> /dev/null; then
+            echo "Installing Docker Compose plugin..."
+            sudo apt-get -o Acquire::Retries=6 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update -q
+            sudo apt-get install -y docker-compose-plugin
+          fi
+
+          # Verify
+          docker --version
+          docker compose version
+          echo "✅ Docker is ready"
+
+      - name: Install and Start Tailscale
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Installing Tailscale..."
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+          echo "Starting Tailscale..."
+          sudo tailscale up --auth-key=${{ steps.config.outputs.tailscale_api_key }}
+
+          echo "Tailscale status:"
+          tailscale status
+          echo "✅ Tailscale is up"
+
+      - name: Configure VNC Server
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          export PATH=$PATH:/opt/TurboVNC/bin
+          mkdir -p ~/.vnc
+          
+          # Create password file
+          echo "${{ steps.config.outputs.vnc_password }}" | vncpasswd -f > ~/.vnc/passwd
+          chmod 600 ~/.vnc/passwd
+          
+          # Create xstartup script
+          cat > ~/.vnc/xstartup.turbovnc << 'EOF'
+          #!/bin/bash
+          # Suppress accessibility warnings
+          export NO_AT_BRIDGE=1
+          export SESSION_MANAGER=""
+          
+          # Start XFCE desktop
+          dbus-launch /usr/bin/startxfce4 &
+          EOF
+          
+          chmod +x ~/.vnc/xstartup.turbovnc
+
+      - name: Start VNC Server
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          export PATH=$PATH:/opt/TurboVNC/bin
+          echo "Starting TurboVNC server on display :1..."
+
+          vncserver :1 -geometry 1920x1080 -depth 24 -rfbport $VNC_PORT 2>&1 | tee /tmp/vnc-start.log
+
+          # Health check - wait up to 15s, exit early when ready
+          for i in $(seq 1 15); do
+            if pgrep -f "Xvnc.*:1" > /dev/null; then
+              echo "✅ TurboVNC Server started in ${i}s on port $VNC_PORT"
+              ps aux | grep Xvnc | grep -v grep
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "❌ Failed to start VNC server"
+          cat /tmp/vnc-start.log
+          exit 1
+
+      - name: Start noVNC (Web VNC)
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Starting noVNC web server..."
+          cd ~/noVNC
+          ./utils/novnc_proxy --vnc localhost:$VNC_PORT --listen $NOVNC_PORT &
+
+          # Health check - wait up to 10s
+          for i in $(seq 1 10); do
+            if netstat -tuln | grep :$NOVNC_PORT > /dev/null; then
+              echo "✅ noVNC started in ${i}s on port $NOVNC_PORT"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "❌ noVNC failed to start"
+          exit 1
+
+      - name: Download and Setup BotXByte Extension
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Setting up BotXByte extension..."
+
+          DOWNLOADS_DIR="$HOME/Downloads"
+          EXTENSION_DIR="$DOWNLOADS_DIR/real-botxbyte-extension"
+          mkdir -p "$DOWNLOADS_DIR"
+
+          # Always download fresh extension (remove any cached version)
+          rm -rf "$EXTENSION_DIR" 2>/dev/null || true
+
+          echo "Downloading BotXByte extension..."
+
+          # Download the extension zip
+          wget -O "$DOWNLOADS_DIR/real-botxbyte-extension.zip" \
+            "https://raw.githubusercontent.com/sanket-sakariya/test-abc/main/real-botxbyte-extension.zip"
+
+          # Extract to a temp location to handle nested directories
+          TEMP_EXTRACT="/tmp/extension-extract"
+          rm -rf "$TEMP_EXTRACT"
+          mkdir -p "$TEMP_EXTRACT"
+          unzip -o "$DOWNLOADS_DIR/real-botxbyte-extension.zip" -d "$TEMP_EXTRACT"
+          rm "$DOWNLOADS_DIR/real-botxbyte-extension.zip"
+
+          # Find where manifest.json actually is
+          MANIFEST_PATH=$(find "$TEMP_EXTRACT" -name "manifest.json" -type f | head -1)
+          if [ -z "$MANIFEST_PATH" ]; then
+            echo "❌ manifest.json not found in extracted zip!"
+            find "$TEMP_EXTRACT" -type f
+            exit 1
+          fi
+
+          ACTUAL_EXT_DIR=$(dirname "$MANIFEST_PATH")
+          echo "Found manifest.json at: $MANIFEST_PATH"
+
+          # Move to the expected location
+          rm -rf "$EXTENSION_DIR"
+          mv "$ACTUAL_EXT_DIR" "$EXTENSION_DIR"
+          rm -rf "$TEMP_EXTRACT"
+
+          # Clean up stale/non-extension files
+          rm -rf "$EXTENSION_DIR/_metadata" 2>/dev/null || true
+          rm -rf "$EXTENSION_DIR/.git" 2>/dev/null || true
+          rm -f "$EXTENSION_DIR/.gitignore" "$EXTENSION_DIR/README.md" "$EXTENSION_DIR/llm.txt"
+
+          echo "Extension contents:"
+          ls -la "$EXTENSION_DIR/"
+          echo "manifest.json:"
+          cat "$EXTENSION_DIR/manifest.json"
+
+          # Set up Python virtual environment and install requirements
+          cd "$EXTENSION_DIR"
+          python3 -m venv venv
+          source venv/bin/activate
+
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+            echo "✅ Requirements installed in venv"
+          else
+            echo "⚠️ No requirements.txt found"
+          fi
+
+          echo "✅ BotXByte Extension setup complete"
+          echo "  Extension path: $EXTENSION_DIR"
+
+
+      - name: Start BotXByte Server
+        if: steps.config.outputs.vnc_enabled == 'true'
+        id: botxbyte_server
+        run: |
+          echo "Starting BotXByte server (server.py)..."
+
+          EXTENSION_DIR="$HOME/Downloads/real-botxbyte-extension"
+          cd "$EXTENSION_DIR"
+
+          source venv/bin/activate
+          export WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+
+          python3 server.py &
+          SERVER_PID=$!
+          echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
+
+          sleep 3
+
+          if kill -0 $SERVER_PID 2>/dev/null; then
+            echo "✅ BotXByte server started (PID: $SERVER_PID)"
+            echo "  WebSocket: ws://localhost:8765"
+            echo "  HTTP API:  http://localhost:8766"
+          else
+            echo "❌ BotXByte server failed to start"
+            exit 1
+          fi
+
+      - name: Setup Browser Profile
+        if: steps.config.outputs.vnc_enabled == 'true'
+        id: browser_profile
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.config.outputs.wasabi_access_key }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.config.outputs.wasabi_secret_key }}
+          AWS_DEFAULT_REGION: ${{ steps.config.outputs.wasabi_region }}
+        run: |
+          BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
+          WASABI_BUCKET="${{ steps.config.outputs.wasabi_bucket }}"
+          WASABI_ENDPOINT="${{ steps.config.outputs.wasabi_endpoint }}"
+          PROFILE_DIR="$HOME/browser-profiles/${BROWSER_PROFILE_ID}"
+          WASABI_KEY="browser-profiles/${BROWSER_PROFILE_ID}.zip"
+
+          echo "browser_profile_dir=$PROFILE_DIR" >> $GITHUB_OUTPUT
+
+          mkdir -p "$HOME/browser-profiles"
+
+          PROFILE_EXISTS="false"
+
+          # Check if browser profile exists in Wasabi
+          if [ -n "$WASABI_BUCKET" ] && [ "$WASABI_BUCKET" != "" ] && [ -n "$BROWSER_PROFILE_ID" ] && [ "$BROWSER_PROFILE_ID" != "" ]; then
+            echo "Checking Wasabi for existing browser profile: $WASABI_KEY"
+
+            if aws s3 ls "s3://${WASABI_BUCKET}/${WASABI_KEY}" --endpoint-url "$WASABI_ENDPOINT" 2>/dev/null; then
+              echo "✅ Browser profile found in Wasabi! Downloading..."
+              PROFILE_EXISTS="true"
+
+              # Download the zip
+              aws s3 cp "s3://${WASABI_BUCKET}/${WASABI_KEY}" "/tmp/${BROWSER_PROFILE_ID}.zip" \
+                --endpoint-url "$WASABI_ENDPOINT"
+
+              echo "Extracting browser profile..."
+              unzip -o "/tmp/${BROWSER_PROFILE_ID}.zip" -d "$HOME/browser-profiles/"
+              rm -f "/tmp/${BROWSER_PROFILE_ID}.zip"
+
+              if [ -d "$PROFILE_DIR" ]; then
+                echo "✅ Browser profile extracted to: $PROFILE_DIR"
+                echo "  Profile size: $(du -sh "$PROFILE_DIR" | cut -f1)"
+              else
+                echo "⚠️ Extraction did not produce expected directory, creating fresh profile"
+                PROFILE_EXISTS="false"
+              fi
+            else
+              echo "No existing browser profile found in Wasabi"
+            fi
+          else
+            echo "⚠️ Wasabi not configured or no browser_profile_id, using fresh profile"
+          fi
+
+          # If no profile exists, create a fresh one
+          if [ "$PROFILE_EXISTS" = "false" ]; then
+            echo "Creating fresh browser profile: $PROFILE_DIR"
+            mkdir -p "$PROFILE_DIR"
+            echo "✅ Fresh browser profile directory created"
+          fi
+
+          echo "profile_exists=$PROFILE_EXISTS" >> $GITHUB_OUTPUT
+          echo "Browser Profile ID: $BROWSER_PROFILE_ID"
+          echo "Profile Directory: $PROFILE_DIR"
+
+      - name: Open Chrome on Desktop
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Opening Chrome on VNC desktop with browser profile..."
+
+          PROFILE_DIR="${{ steps.browser_profile.outputs.browser_profile_dir }}"
+          echo "Using profile directory: $PROFILE_DIR"
+
+          export DISPLAY=:1
+          export NO_AT_BRIDGE=1
+          export DBUS_SESSION_BUS_ADDRESS=/dev/null
+
+          # Build proxy flag if proxy is configured
+          PROXY_HOST="${{ steps.config.outputs.proxy_host }}"
+          PROXY_PORT="${{ steps.config.outputs.proxy_port }}"
+          PROXY_TYPE="${{ steps.config.outputs.proxy_type }}"
+
+          CHROME_PROXY_FLAG=""
+          if [ -n "$PROXY_HOST" ] && [ "$PROXY_HOST" != "" ] && [ -n "$PROXY_PORT" ] && [ "$PROXY_PORT" != "" ]; then
+            CHROME_PROXY_FLAG="--proxy-server=${PROXY_TYPE}://${PROXY_HOST}:${PROXY_PORT}"
+            echo "Using proxy: $CHROME_PROXY_FLAG"
+          fi
+
+          google-chrome \
+            --no-first-run \
+            --user-data-dir="$PROFILE_DIR" \
+            $CHROME_PROXY_FLAG \
+            2>/tmp/chrome-stderr.log &
+
+          CHROME_PID=$!
+          echo "  Chrome PID: $CHROME_PID"
+          sleep 5
+
+          if pgrep -f "chrome" > /dev/null; then
+            echo "✅ Chrome is running with persistent profile"
+          else
+            echo "❌ Chrome failed to launch"
+            tail -20 /tmp/chrome-stderr.log 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Load or Reload Extension via PyAutoGUI
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          export DISPLAY=:1
+
+          EXTENSION_DIR="$HOME/Downloads/real-botxbyte-extension"
+          PROFILE_EXISTS="${{ steps.browser_profile.outputs.profile_exists }}"
+
+          echo "profile_exists=$PROFILE_EXISTS"
+
+          cd "$EXTENSION_DIR"
+          source venv/bin/activate
+
+          if [ "$PROFILE_EXISTS" = "true" ]; then
+            echo "🔄 Profile existed in Wasabi → running refresh.py (reload extension)"
+            python3 refresh.py
+          else
+            echo "📦 Profile NOT in Wasabi → running opener.py (load extension first time)"
+            python3 opener.py
+          fi
+
+          echo "✅ Extension loader script finished"
+
+      - name: Check Developer Mode and Update DB
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Checking Chrome developer_mode status..."
+
+          PROFILE_DIR="${{ steps.browser_profile.outputs.browser_profile_dir }}"
+          BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
+          USER_ID="${{ steps.config.outputs.user_id }}"
+          WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+
+          # Search for "developer_mode":true in the browser profile preferences
+          IS_CHROME_EXTENSION="false"
+          if grep -rq '"developer_mode":true' "$PROFILE_DIR/" 2>/dev/null; then
+            IS_CHROME_EXTENSION="true"
+            echo "✅ developer_mode is TRUE → setting is_chrome_extension=true"
+          else
+            echo "ℹ️ developer_mode is not true (or not found) → is_chrome_extension=false"
+          fi
+
+          echo "is_chrome_extension: $IS_CHROME_EXTENSION"
+
+          # Log the grep results for debugging
+          echo "--- Developer mode grep results ---"
+          grep -ro '"developer_mode":[^,}]*' "$PROFILE_DIR/" 2>/dev/null || echo "  No developer_mode entries found"
+          echo "---"
+
+          # Update is_chrome_extension in the database via PATCH API
+          if [ -n "$BROWSER_PROFILE_ID" ] && [ "$BROWSER_PROFILE_ID" != "null" ]; then
+            RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+              "http://129.212.196.173/ai-management-service/api/v1/browser-profile/${BROWSER_PROFILE_ID}" \
+              -X PATCH \
+              -H "Content-Type: application/json" \
+              -H "user-id: ${USER_ID}" \
+              -H "workspace-id: ${WORKSPACE_ID}" \
+              -d "{\"is_chrome_extension\": ${IS_CHROME_EXTENSION}}")
+
+            SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+            if [ "$SUCCESS" = "true" ]; then
+              echo "✅ Browser profile updated: is_chrome_extension=$IS_CHROME_EXTENSION"
+            else
+              echo "⚠️ Failed to update is_chrome_extension (non-fatal)"
+              echo "$RESPONSE" | jq '.' 2>/dev/null || echo "$RESPONSE"
+            fi
+          else
+            echo "⚠️ No browser_profile_id, skipping is_chrome_extension DB update"
+          fi
+
+      - name: Install cloudflared
+        if: steps.config.outputs.cloudflare_enabled == 'true'
+        run: |
+          echo "Installing cloudflared..."
+
+          # Check if already installed
+          if command -v cloudflared &> /dev/null; then
+            echo "✅ cloudflared already installed (cached)"
+            cloudflared --version
+            exit 0
+          fi
+
+          # Release dpkg lock held by unattended-upgrades (may still be running
+          # on a fresh Ubuntu runner if the VNC Desktop Environment step was skipped)
+          sudo systemctl stop unattended-upgrades 2>/dev/null || true
+          sudo killall -9 unattended-upgrades 2>/dev/null || true
+          for i in $(seq 1 12); do
+            if ! sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+              break
+            fi
+            echo "Waiting for dpkg lock to release... ($i/12)"
+            sleep 5
+          done
+
+          mkdir -p ~/cached-debs
+
+          # Use cached deb if available, otherwise download
+          if [ -f ~/cached-debs/cloudflared-linux-amd64.deb ]; then
+            echo "Using cached cloudflared deb..."
+          else
+            echo "Downloading cloudflared..."
+            wget -q -O ~/cached-debs/cloudflared-linux-amd64.deb \
+              https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          fi
+
+          sudo dpkg -i ~/cached-debs/cloudflared-linux-amd64.deb
+          cloudflared --version
+          echo "✅ cloudflared installed"
+
+      - name: Cleanup Existing Cloudflare Tunnel
+        if: steps.config.outputs.cloudflare_enabled == 'true'
+        run: |
+          echo "Checking for existing tunnel..."
+          TUNNEL_NAME="vnc-${{ steps.config.outputs.browser_profile_id }}"
+          echo "Tunnel name: $TUNNEL_NAME"
+
+          # List tunnels and find matching one
+          EXISTING_TUNNEL=$(curl -s --connect-timeout 10 --max-time 30 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel?name=${TUNNEL_NAME}" \
+            --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" | jq -r '.result[0].id // empty')
+
+          if [ -n "$EXISTING_TUNNEL" ]; then
+            echo "Found existing tunnel: $EXISTING_TUNNEL"
+
+            # First, try to clean up tunnel connections
+            echo "Cleaning up tunnel connections..."
+            CLEANUP_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${EXISTING_TUNNEL}/connections" \
+              --request DELETE \
+              --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
+            echo "Cleanup connections response: $CLEANUP_RESPONSE"
+
+            # Wait for connections to close
+            sleep 5
+
+            # Retry deletion with backoff
+            MAX_RETRIES=3
+            RETRY_COUNT=0
+            DELETE_SUCCESS=false
+
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$DELETE_SUCCESS" != "true" ]; do
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              echo "Attempting to delete tunnel (attempt $RETRY_COUNT/$MAX_RETRIES)..."
+
+              DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${EXISTING_TUNNEL}" \
+                --request DELETE \
+                --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
+
+              DELETE_SUCCESS=$(echo "$DELETE_RESPONSE" | jq -r '.success // false')
+
+              if [ "$DELETE_SUCCESS" = "true" ]; then
+                echo "✅ Old tunnel deleted successfully"
+              else
+                ERROR_MSG=$(echo "$DELETE_RESPONSE" | jq -r '.errors[0].message // "Unknown error"')
+                echo "⚠️ Delete attempt $RETRY_COUNT failed: $ERROR_MSG"
+                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                  WAIT_TIME=$((RETRY_COUNT * 2))
+                  echo "Waiting ${WAIT_TIME} seconds before retry..."
+                  sleep $WAIT_TIME
+                fi
+              fi
+            done
+
+            if [ "$DELETE_SUCCESS" != "true" ]; then
+              echo "⚠️ Could not delete existing tunnel after $MAX_RETRIES attempts. Will try to create a new tunnel anyway."
+            fi
+          else
+            echo "No existing tunnel found"
+          fi
+
+      - name: Create Cloudflare Tunnel
+        if: steps.config.outputs.cloudflare_enabled == 'true'
+        id: tunnel
+        run: |
+          echo "Creating Cloudflare Tunnel..."
+          TUNNEL_NAME="vnc-${{ steps.config.outputs.browser_profile_id }}"
+          echo "Tunnel name: $TUNNEL_NAME"
+
+          RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel" \
+            --request POST \
+            --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" \
+            --header "Content-Type: application/json" \
+            --data "{
+              \"name\": \"${TUNNEL_NAME}\",
+              \"config_src\": \"cloudflare\"
+            }")
+          
+          # Check if tunnel creation was successful
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+          if [ "$SUCCESS" != "true" ]; then
+            echo "❌ Failed to create tunnel"
+            echo "$RESPONSE" | jq '.'
+            exit 1
+          fi
+          
+          TUNNEL_ID=$(echo "$RESPONSE" | jq -r '.result.id')
+          TUNNEL_TOKEN=$(echo "$RESPONSE" | jq -r '.result.token')
+          
+          if [ -z "$TUNNEL_ID" ] || [ "$TUNNEL_ID" = "null" ]; then
+            echo "❌ Failed to extract tunnel ID"
+            exit 1
+          fi
+          
+          echo "tunnel_id=$TUNNEL_ID" >> $GITHUB_OUTPUT
+          echo "tunnel_token=$TUNNEL_TOKEN" >> $GITHUB_OUTPUT
+          echo "✅ Tunnel created: $TUNNEL_ID"
+
+      - name: Configure Tunnel
+        if: steps.config.outputs.cloudflare_enabled == 'true'
+        run: |
+          echo "Configuring tunnel for noVNC..."
+          
+          RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${{ steps.tunnel.outputs.tunnel_id }}/configurations" \
+            --request PUT \
+            --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" \
+            --header "Content-Type: application/json" \
+            --data "{
+              \"config\": {
+                \"ingress\": [
+                  {
+                    \"hostname\": \"${{ steps.config.outputs.hostname }}\",
+                    \"path\": \"/(workflow|terminal|status|transcribe|profile|chrome|server-logs|\\\\d+).*\",
+                    \"service\": \"http://localhost:8766\",
+                    \"originRequest\": {}
+                  },
+                  {
+                    \"hostname\": \"${{ steps.config.outputs.hostname }}\",
+                    \"service\": \"http://localhost:${NOVNC_PORT}\",
+                    \"originRequest\": {}
+                  },
+                  {
+                    \"service\": \"http_status:404\"
+                  }
+                ]
+              }
+            }")
+          
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+          if [ "$SUCCESS" != "true" ]; then
+            echo "❌ Failed to configure tunnel"
+            echo "$RESPONSE" | jq '.'
+            exit 1
+          fi
+          
+          echo "✅ Tunnel configured"
+
+      - name: Create DNS Record
+        if: steps.config.outputs.cloudflare_enabled == 'true'
+        run: |
+          echo "Creating DNS record..."
+          
+          FULL_HOSTNAME="${{ steps.config.outputs.hostname }}"
+          echo "Hostname: $FULL_HOSTNAME"
+          echo "Tunnel ID: ${{ steps.tunnel.outputs.tunnel_id }}"
+          echo "Target: ${{ steps.tunnel.outputs.tunnel_id }}.cfargotunnel.com"
+          
+          # Check for existing DNS record
+          EXISTING_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records?name=${FULL_HOSTNAME}" \
+            --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
+          
+          echo "Existing DNS check response:"
+          echo "$EXISTING_RESPONSE" | jq '.'
+          
+          EXISTING=$(echo "$EXISTING_RESPONSE" | jq -r '.result[0].id // empty')
+          
+          if [ -n "$EXISTING" ]; then
+            echo "⚠️ DNS record already exists (ID: $EXISTING), deleting..."
+            DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records/${EXISTING}" \
+              --request DELETE \
+              --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
+            echo "Delete response:"
+            echo "$DELETE_RESPONSE" | jq '.'
+            sleep 2
+          fi
+
+          # Create new DNS record
+          echo "Creating new DNS record..."
+          RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records" \
+            --request POST \
+            --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" \
+            --header "Content-Type: application/json" \
+            --data "{
+              \"type\": \"CNAME\",
+              \"proxied\": true,
+              \"name\": \"${FULL_HOSTNAME}\",
+              \"content\": \"${{ steps.tunnel.outputs.tunnel_id }}.cfargotunnel.com\"
+            }")
+          
+          echo "Create DNS response:"
+          echo "$RESPONSE" | jq '.'
+          
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+          if [ "$SUCCESS" != "true" ]; then
+            echo "❌ Failed to create DNS record"
+            echo "Error details:"
+            echo "$RESPONSE" | jq '.errors'
+            exit 1
+          fi
+          
+          DNS_RECORD_ID=$(echo "$RESPONSE" | jq -r '.result.id')
+          echo "✅ DNS record created successfully (ID: $DNS_RECORD_ID)"
+
+      - name: Start Cloudflare Tunnel
+        if: steps.config.outputs.cloudflare_enabled == 'true'
+        run: |
+          echo "Starting Cloudflare Tunnel..."
+          cloudflared tunnel run --token ${{ steps.tunnel.outputs.tunnel_token }} > /tmp/tunnel.log 2>&1 &
+
+          # Health check - wait up to 15s
+          for i in $(seq 1 15); do
+            if pgrep -x "cloudflared" > /dev/null; then
+              echo "✅ Cloudflare Tunnel started in ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "❌ Cloudflare tunnel failed to start"
+          cat /tmp/tunnel.log
+          exit 1
+
+      - name: Register Tunnel URL with Backend
+        if: steps.config.outputs.cloudflare_enabled == 'true'
+        run: |
+          echo "Registering tunnel URL with backend..."
+
+          FULL_HOSTNAME="${{ steps.config.outputs.hostname }}"
+          TUNNEL_URL="https://${FULL_HOSTNAME}"
+          USER_ID="${{ steps.config.outputs.user_id }}"
+          WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+          BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
+          CLOUDFLARE_TUNNEL_CREDENTIAL_ID="${{ steps.config.outputs.cloudflare_tunnel_credential_id }}"
+          WORKFLOW_IDS='${{ steps.config.outputs.workflow_ids }}'
+
+          # Build base JSON body
+          BODY="{
+            \"tunnel_url\": \"${TUNNEL_URL}\",
+            \"browser_profile_id\": \"${BROWSER_PROFILE_ID}\",
+            \"status\": \"created\",
+            \"is_active\": true"
+
+          # Append optional cloudflare_tunnel_credential_id
+          if [ -n "$CLOUDFLARE_TUNNEL_CREDENTIAL_ID" ] && [ "$CLOUDFLARE_TUNNEL_CREDENTIAL_ID" != "null" ]; then
+            BODY="${BODY}, \"cloudflare_tunnel_credential_id\": \"${CLOUDFLARE_TUNNEL_CREDENTIAL_ID}\""
+          fi
+
+          # Append optional workflow_ids for auto-task dispatch (JSON array)
+          if [ -n "$WORKFLOW_IDS" ] && [ "$WORKFLOW_IDS" != "null" ] && [ "$WORKFLOW_IDS" != "[]" ]; then
+            BODY="${BODY}, \"workflow_ids\": ${WORKFLOW_IDS}"
+          fi
+
+          BODY="${BODY} }"
+
+          echo "Request body: $BODY"
+
+          RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+            "http://129.212.196.173/ai-management-service/api/v1/cloudflare-tunnel-info/create/" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "user-id: ${USER_ID}" \
+            -H "workspace-id: ${WORKSPACE_ID}" \
+            -d "$BODY")
+
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+          if [ "$SUCCESS" = "true" ]; then
+            echo "✅ Tunnel URL registered: ${TUNNEL_URL}"
+          else
+            echo "⚠️ Failed to register tunnel URL (non-fatal)"
+            echo "$RESPONSE" | jq '.' 2>/dev/null || echo "$RESPONSE"
+          fi
+
+      - name: Display VNC Connection Info
+        if: steps.config.outputs.cloudflare_enabled == 'true'
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║          🎉 UBUNTU DESKTOP VNC IS NOW RUNNING! 🎉            ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "🌐 Access URL: https://${{ steps.config.outputs.hostname }}/vnc.html"
+          echo "🔑 Password: (configured)"
+          echo ""
+          echo "🔌 BotXByte server.py running"
+          echo "   WebSocket: ws://localhost:8765"
+          echo "   HTTP API:  http://localhost:8766"
+          echo ""
+          echo "📦 Extension ready at: ~/Downloads/real-botxbyte-extension"
+          echo "   Load it manually: Chrome > Extensions > Developer Mode > Load Unpacked"
+          echo ""
+
+      - name: Save Dependencies Cache
+        if: steps.config.outputs.vnc_enabled == 'true' && steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/cached-debs
+            ~/noVNC
+            ~/.cache/pip
+          key: vnc-deps-v5-${{ runner.os }}
+
+      - name: Keep VNC Session Alive
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          export PATH=$PATH:/opt/TurboVNC/bin
+          export DBUS_SESSION_BUS_ADDRESS=/dev/null
+
+          echo "Keeping VNC session alive..."
+
+          # Monitor for configured timeout (default 45 min)
+          TIMEOUT_SECONDS=${{ steps.config.outputs.profile_timeout_seconds }}
+          TIMEOUT_MINUTES=${{ steps.config.outputs.profile_timeout_minutes }}
+          echo "⏱️ Profile timeout: ${TIMEOUT_MINUTES} minutes (${TIMEOUT_SECONDS} seconds)"
+          END_TIME=$((SECONDS + TIMEOUT_SECONDS))
+
+          while [ $SECONDS -lt $END_TIME ]; do
+            REMAINING=$((END_TIME - SECONDS))
+            HOURS=$((REMAINING / 3600))
+            MINUTES=$(((REMAINING % 3600) / 60))
+
+            if [ "${{ steps.config.outputs.cloudflare_enabled }}" = "true" ]; then
+              echo "⏱️ Remaining: ${HOURS}h ${MINUTES}m | Access: https://${{ steps.config.outputs.hostname }}/vnc.html"
+            else
+              echo "⏱️ Remaining: ${HOURS}h ${MINUTES}m | VNC running locally"
+            fi
+
+            # Check and restart VNC if needed
+            if ! pgrep -f "Xvnc.*:1" > /dev/null; then
+              echo "❌ VNC stopped! Restarting..."
+              vncserver :1 -geometry 1920x1080 -depth 24 -rfbport $VNC_PORT
+              sleep 3
+              if ! pgrep -f "Xvnc.*:1" > /dev/null; then
+                echo "❌ Failed to restart VNC! Exiting..."
+                exit 1
+              fi
+              echo "✅ VNC restarted successfully"
+            fi
+
+            # Check and restart tunnel if Cloudflare is enabled
+            if [ "${{ steps.config.outputs.cloudflare_enabled }}" = "true" ]; then
+              if ! pgrep -x "cloudflared" > /dev/null; then
+                echo "❌ Tunnel stopped! Restarting..."
+                cloudflared tunnel run --token ${{ steps.tunnel.outputs.tunnel_token }} > /tmp/tunnel.log 2>&1 &
+                sleep 5
+                if ! pgrep -x "cloudflared" > /dev/null; then
+                  echo "❌ Failed to restart tunnel! Exiting..."
+                  cat /tmp/tunnel.log
+                  exit 1
+                fi
+                echo "✅ Tunnel restarted successfully"
+              fi
+            fi
+
+            # Check and restart BotXByte server if needed
+            if ! pgrep -f "server.py" > /dev/null; then
+              echo "❌ BotXByte server stopped! Restarting..."
+              EXTENSION_DIR="$HOME/Downloads/real-botxbyte-extension"
+              cd "$EXTENSION_DIR"
+              source venv/bin/activate
+              export WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+              python3 server.py &
+              sleep 3
+              if pgrep -f "server.py" > /dev/null; then
+                echo "✅ BotXByte server restarted"
+              else
+                echo "⚠️ BotXByte server failed to restart"
+              fi
+            fi
+
+            # Check and restart Chrome if needed
+            if ! pgrep -f "google-chrome" > /dev/null; then
+              echo "❌ Chrome stopped! Restarting..."
+              export DISPLAY=:1
+              export NO_AT_BRIDGE=1
+              PROFILE_DIR="${{ steps.browser_profile.outputs.browser_profile_dir }}"
+              PROXY_HOST="${{ steps.config.outputs.proxy_host }}"
+              PROXY_PORT="${{ steps.config.outputs.proxy_port }}"
+              PROXY_TYPE="${{ steps.config.outputs.proxy_type }}"
+              CHROME_PROXY_FLAG=""
+              if [ -n "$PROXY_HOST" ] && [ "$PROXY_HOST" != "" ] && [ -n "$PROXY_PORT" ] && [ "$PROXY_PORT" != "" ]; then
+                CHROME_PROXY_FLAG="--proxy-server=${PROXY_TYPE}://${PROXY_HOST}:${PROXY_PORT}"
+              fi
+              google-chrome \
+                --no-first-run \
+                --no-default-browser-check \
+                --user-data-dir="$PROFILE_DIR" \
+                $CHROME_PROXY_FLAG \
+                2>/tmp/chrome-stderr.log &
+              sleep 5
+              if pgrep -f "google-chrome" > /dev/null; then
+                echo "✅ Chrome restarted"
+              else
+                echo "⚠️ Chrome failed to restart"
+              fi
+            fi
+
+            sleep 30
+          done
+
+          echo "✅ Session time expired"
+
+      - name: Cleanup BotXByte Server and Chrome
+        if: always() && steps.config.outputs.vnc_enabled == 'true'
+        timeout-minutes: 1
+        run: |
+          echo "Cleaning up BotXByte server and Chrome..."
+
+          # Kill Chrome
+          pkill -f "google-chrome" || true
+
+          # Kill server.py
+          pkill -f "server.py" || true
+
+          sleep 2
+          echo "✅ BotXByte cleanup complete"
+
+      - name: Cleanup Cloudflare Tunnel and DNS
+        if: always() && steps.config.outputs.cloudflare_enabled == 'true'
+        timeout-minutes: 3
+        run: |
+          echo "Cleaning up Cloudflare tunnel and DNS record..."
+
+          # Stop cloudflared process
+          pkill -x cloudflared || true
+          sleep 2
+
+          # Delete tunnel info from AI Management Service
+          FULL_HOSTNAME="${{ steps.config.outputs.hostname }}"
+          if [ -n "$FULL_HOSTNAME" ] && [ "$FULL_HOSTNAME" != "null" ]; then
+            echo "Deleting tunnel info from AI Management Service..."
+
+            USER_ID="${{ steps.config.outputs.user_id }}"
+            WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+            BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
+
+            # Build URL with parameters
+            DELETE_URL="http://129.212.196.173/ai-management-service/api/v1/cloudflare-tunnel-info/delete/?tunnel_url=https://${FULL_HOSTNAME}"
+
+            # Add browser_profile_id if it exists
+            if [ -n "$BROWSER_PROFILE_ID" ] && [ "$BROWSER_PROFILE_ID" != "null" ]; then
+              DELETE_URL="${DELETE_URL}&browser_profile_id=${BROWSER_PROFILE_ID}"
+            fi
+
+            DELETE_TUNNEL_INFO=$(curl -s --connect-timeout 10 --max-time 30 "$DELETE_URL" \
+              -X DELETE \
+              -H "user-id: ${USER_ID}" \
+              -H "workspace-id: ${WORKSPACE_ID}")
+
+            echo "Tunnel info deletion response:"
+            echo "$DELETE_TUNNEL_INFO"
+          fi
+
+          # Delete DNS record
+          if [ -n "$FULL_HOSTNAME" ] && [ "$FULL_HOSTNAME" != "null" ]; then
+            echo "Deleting DNS record for ${FULL_HOSTNAME}..."
+            EXISTING_DNS=$(curl -s --connect-timeout 10 --max-time 30 \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records?name=${FULL_HOSTNAME}" \
+              --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" | jq -r '.result[0].id // empty')
+
+            if [ -n "$EXISTING_DNS" ]; then
+              DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records/${EXISTING_DNS}" \
+                --request DELETE \
+                --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
+
+              DELETE_SUCCESS=$(echo "$DELETE_RESPONSE" | jq -r '.success // false')
+              if [ "$DELETE_SUCCESS" = "true" ]; then
+                echo "✅ DNS record deleted successfully"
+              else
+                echo "⚠️ Failed to delete DNS record"
+                echo "$DELETE_RESPONSE" | jq '.'
+              fi
+            else
+              echo "⚠️ DNS record not found"
+            fi
+          fi
+
+          # Delete Cloudflare tunnel
+          if [ -n "${{ steps.tunnel.outputs.tunnel_id }}" ] && [ "${{ steps.tunnel.outputs.tunnel_id }}" != "null" ]; then
+            echo "Deleting Cloudflare tunnel ${{ steps.tunnel.outputs.tunnel_id }}..."
+            TUNNEL_DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${{ steps.tunnel.outputs.tunnel_id }}" \
+              --request DELETE \
+              --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
+
+            TUNNEL_DELETE_SUCCESS=$(echo "$TUNNEL_DELETE_RESPONSE" | jq -r '.success // false')
+            if [ "$TUNNEL_DELETE_SUCCESS" = "true" ]; then
+              echo "✅ Cloudflare tunnel deleted successfully"
+            else
+              echo "⚠️ Failed to delete Cloudflare tunnel"
+              echo "$TUNNEL_DELETE_RESPONSE" | jq '.'
+            fi
+          else
+            echo "⚠️ Tunnel ID not found"
+          fi
+
+          echo "✅ Cloudflare cleanup complete"
+
+      - name: Cleanup Webshare IP Authorization
+        if: always() && steps.config.outputs.webshare_enabled == 'true'
+        timeout-minutes: 1
+        run: |
+          echo "Deregistering IP from Webshare..."
+
+          if [ -n "${{ steps.webshare.outputs.webshare_auth_id }}" ] && [ "${{ steps.webshare.outputs.webshare_auth_id }}" != "null" ]; then
+            DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+              "https://proxy.webshare.io/api/v2/proxy/ipauthorization/${{ steps.webshare.outputs.webshare_auth_id }}/" \
+              -X DELETE \
+              -H "Authorization: Token ${{ steps.config.outputs.webshare_api_token }}")
+
+            # Check if deletion was successful (empty response or 204 status)
+            if [ -z "$DELETE_RESPONSE" ] || [ "$DELETE_RESPONSE" = "{}" ]; then
+              echo "✅ IP authorization removed from Webshare"
+            else
+              echo "⚠️ Failed to remove IP authorization"
+              echo "$DELETE_RESPONSE"
+            fi
+          else
+            echo "⚠️ No Webshare authorization ID found to delete"
+          fi
+
+          echo "✅ Webshare cleanup complete"
+
+      - name: Cleanup Tailscale
+        if: always() && steps.config.outputs.vnc_enabled == 'true'
+        timeout-minutes: 2
+        run: |
+          echo "Removing this device from tailnet..."
+
+          TAILSCALE_TOKEN="${{ steps.config.outputs.tailscale_token }}"
+
+          if [ -n "$TAILSCALE_TOKEN" ]; then
+            # Get this device's Tailscale IPv4 address
+            TARGET_IP=$(tailscale ip -4 2>/dev/null || echo "")
+
+            if [ -n "$TARGET_IP" ]; then
+              echo "This device IP: $TARGET_IP"
+
+              # Find and remove only this device by matching its IP
+              curl -s "https://api.tailscale.com/api/v2/tailnet/-/devices" \
+                --header "Authorization: Basic $TAILSCALE_TOKEN" | \
+                jq -r '.devices[] | "\(.id) \(.addresses[0])"' | \
+                while read id ip; do
+                  if [[ "$ip" == "$TARGET_IP" ]]; then
+                    echo "🗑️ Removing device with IP $ip (ID: $id)"
+                    curl -s -X DELETE "https://api.tailscale.com/api/v2/device/$id" \
+                      --header "Authorization: Basic $TAILSCALE_TOKEN"
+                    echo "✅ Removed device $id"
+                  fi
+                done
+            else
+              echo "⚠️ Could not get Tailscale IP, skipping API cleanup"
+            fi
+          else
+            echo "⚠️ Missing Tailscale token, skipping API cleanup"
+          fi
+
+          echo "Removing local Tailscale..."
+          sudo tailscale down || true
+          sudo apt-get remove -y tailscale || true
+          sudo apt-get autoremove -y || true
+          echo "✅ Tailscale cleanup complete"
+
+      - name: Cleanup VNC
+        if: always() && steps.config.outputs.vnc_enabled == 'true'
+        timeout-minutes: 1
+        run: |
+          export PATH=$PATH:/opt/TurboVNC/bin
+          echo "Cleaning up VNC server..."
+
+          vncserver -kill :1 || true
+
+          echo "✅ VNC cleanup complete"
+
+      - name: Upload Browser Profile to Wasabi
+        if: always() && steps.config.outputs.vnc_enabled == 'true' && steps.config.outputs.wasabi_access_key != ''
+        timeout-minutes: 5
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.config.outputs.wasabi_access_key }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.config.outputs.wasabi_secret_key }}
+          AWS_DEFAULT_REGION: ${{ steps.config.outputs.wasabi_region }}
+        run: |
+          echo "Uploading browser profile to Wasabi..."
+
+          BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
+          WASABI_BUCKET="${{ steps.config.outputs.wasabi_bucket }}"
+          WASABI_ENDPOINT="${{ steps.config.outputs.wasabi_endpoint }}"
+          PROFILE_DIR="$HOME/browser-profiles/${BROWSER_PROFILE_ID}"
+          WASABI_KEY="browser-profiles/${BROWSER_PROFILE_ID}.zip"
+
+          # Debug: verify credentials are available
+          echo "  AWS_ACCESS_KEY_ID set: $([ -n "$AWS_ACCESS_KEY_ID" ] && echo 'yes' || echo 'no')"
+          echo "  AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION"
+          echo "  Wasabi Endpoint: $WASABI_ENDPOINT"
+          echo "  Wasabi Bucket: $WASABI_BUCKET"
+          echo "  Browser Profile ID: $BROWSER_PROFILE_ID"
+
+          if [ -z "$BROWSER_PROFILE_ID" ] || [ "$BROWSER_PROFILE_ID" = "" ]; then
+            echo "⚠️ No browser_profile_id, skipping upload"
+            exit 0
+          fi
+
+          if [ ! -d "$PROFILE_DIR" ]; then
+            echo "⚠️ Browser profile directory not found: $PROFILE_DIR, skipping upload"
+            ls -la "$HOME/browser-profiles/" 2>/dev/null || echo "  browser-profiles dir does not exist"
+            exit 0
+          fi
+
+          echo "Cleaning up browser profile cache files..."
+          echo "  Profile size before cleanup: $(du -sh "$PROFILE_DIR" | cut -f1)"
+
+          # Remove Chrome cache directories to reduce upload size
+          find "$PROFILE_DIR" -type d \( \
+            -name "Cache" \
+            -o -name "Code Cache" \
+            -o -name "GPUCache" \
+            -o -name "ShaderCache" \
+            -o -name "GrShaderCache" \
+            -o -name "CacheStorage" \
+            -o -name "ScriptCache" \
+            -o -name "Service Worker" \
+            -o -name "blob_storage" \
+            -o -name "IndexedDB" \
+            -o -name "Session Storage" \
+            -o -name "Crashpad" \
+            -o -name "BrowserMetrics" \
+          \) -exec rm -rf {} + 2>/dev/null || true
+
+          # Remove large temporary/log files
+          find "$PROFILE_DIR" -type f \( \
+            -name "*.log" \
+            -o -name "*.tmp" \
+            -o -name "LOG" \
+            -o -name "LOG.old" \
+            -o -name "LOCK" \
+            -o -name "TransportSecurity" \
+          \) -delete 2>/dev/null || true
+
+          echo "  Profile size after cleanup: $(du -sh "$PROFILE_DIR" | cut -f1)"
+
+          echo "Zipping browser profile: $PROFILE_DIR"
+          cd "$HOME/browser-profiles"
+          zip -r "/tmp/${BROWSER_PROFILE_ID}.zip" "${BROWSER_PROFILE_ID}/" -x "*/SingletonLock" "*/SingletonCookie" "*/SingletonSocket"
+
+          ZIP_SIZE=$(du -sh "/tmp/${BROWSER_PROFILE_ID}.zip" | cut -f1)
+          echo "  Zip size: $ZIP_SIZE"
+
+          echo "Uploading to Wasabi: s3://${WASABI_BUCKET}/${WASABI_KEY}"
+          aws s3 cp "/tmp/${BROWSER_PROFILE_ID}.zip" "s3://${WASABI_BUCKET}/${WASABI_KEY}" \
+            --endpoint-url "$WASABI_ENDPOINT"
+
+          echo "✅ Browser profile uploaded to Wasabi successfully"
+          echo "  Bucket: $WASABI_BUCKET"
+          echo "  Key: $WASABI_KEY"
+          echo "  Size: $ZIP_SIZE"
+
+          rm -f "/tmp/${BROWSER_PROFILE_ID}.zip"
+
+      - name: Trigger Auto-Restart
+        if: always() && steps.config.outputs.vnc_enabled == 'true'
+        timeout-minutes: 5
+        run: |
+          echo "Triggering auto-restart check..."
+
+          BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
+          USER_ID="${{ steps.config.outputs.user_id }}"
+          WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+
+          if [ -z "$BROWSER_PROFILE_ID" ] || [ "$BROWSER_PROFILE_ID" = "null" ]; then
+            echo "⚠️ No browser_profile_id, skipping auto-restart trigger"
+            exit 0
+          fi
+
+          # Call the auto-restart trigger endpoint
+          # Timeout is set to 180s to accommodate delay_seconds (default 30s) + github-management-service call time
+          echo "Calling auto-restart trigger for profile: $BROWSER_PROFILE_ID"
+
+          RESPONSE=$(curl -s --connect-timeout 30 --max-time 180 \
+            -X POST \
+            "http://129.212.196.173/ai-management-service/api/v1/browser-profile/auto-restart/trigger" \
+            -H "Content-Type: application/json" \
+            -H "user-id: ${USER_ID}" \
+            -H "workspace-id: ${WORKSPACE_ID}" \
+            -d "{\"profile_id\": \"${BROWSER_PROFILE_ID}\", \"reason\": \"timeout\"}")
+
+          echo "Auto-restart trigger response:"
+          echo "$RESPONSE" | jq '.' 2>/dev/null || echo "$RESPONSE"
+
+          # Check if restart was triggered
+          RESTARTED=$(echo "$RESPONSE" | jq -r '.data.restarted // false')
+          if [ "$RESTARTED" = "true" ]; then
+            echo "✅ Auto-restart triggered successfully"
+          else
+            REASON=$(echo "$RESPONSE" | jq -r '.data.reason // "unknown"')
+            echo "ℹ️ Auto-restart not triggered: $REASON"
+          fi
+
+          echo "✅ Auto-restart check complete"
