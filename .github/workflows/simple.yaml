@@ -112,16 +112,6 @@ jobs:
             echo "✅ Webshare Config Loaded"
           fi
 
-          # Parse Tailscale config
-          TAILSCALE_API_KEY=$(echo "$CONFIG" | jq -r '.tailscale_api_key // ""')
-          TAILSCALE_TOKEN=$(echo "$CONFIG" | jq -r '.tailscale_token // ""')
-          echo "tailscale_api_key=$TAILSCALE_API_KEY" >> $GITHUB_OUTPUT
-          echo "tailscale_token=$TAILSCALE_TOKEN" >> $GITHUB_OUTPUT
-
-          if [ -n "$TAILSCALE_API_KEY" ] && [ "$TAILSCALE_API_KEY" != "" ]; then
-            echo "✅ Tailscale Config Loaded"
-          fi
-
           # Parse optional workflow_ids for auto-task dispatch (JSON array)
           WORKFLOW_IDS=$(echo "$CONFIG" | jq -c '.workflow_ids // []')
           echo "workflow_ids=$WORKFLOW_IDS" >> $GITHUB_OUTPUT
@@ -419,19 +409,6 @@ jobs:
           docker compose version
           echo "✅ Docker is ready"
 
-      - name: Install and Start Tailscale
-        if: steps.config.outputs.vnc_enabled == 'true'
-        run: |
-          echo "Installing Tailscale..."
-          curl -fsSL https://tailscale.com/install.sh | sh
-
-          echo "Starting Tailscale..."
-          sudo tailscale up --auth-key=${{ steps.config.outputs.tailscale_api_key }}
-
-          echo "Tailscale status:"
-          tailscale status
-          echo "✅ Tailscale is up"
-
       - name: Configure VNC Server
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
@@ -608,30 +585,73 @@ jobs:
 
           mkdir -p "$HOME/browser-profiles"
 
+          # Best-effort step: never let any aws / unzip / awk failure abort
+          # the workflow. We always end up either with the downloaded
+          # profile OR a fresh empty one — both are valid.
+          set +e
+
           PROFILE_EXISTS="false"
 
+          # Maximum size of an existing Wasabi profile that we will pull down
+          # at start. Anything bigger is considered "polluted" (cache crud /
+          # extension databases the cleanup step couldn't trim). We delete it
+          # from Wasabi and start fresh with the same UUID — we do NOT
+          # download a >500 MB profile under any circumstance.
+          MAX_PROFILE_BYTES=524288000  # 500 MB
+
           # Check if browser profile exists in Wasabi
-          if [ -n "$WASABI_BUCKET" ] && [ "$WASABI_BUCKET" != "" ] && [ -n "$BROWSER_PROFILE_ID" ] && [ "$BROWSER_PROFILE_ID" != "" ]; then
+          if [ -n "$WASABI_BUCKET" ] && [ -n "$BROWSER_PROFILE_ID" ]; then
             echo "Checking Wasabi for existing browser profile: $WASABI_KEY"
 
-            if aws s3 ls "s3://${WASABI_BUCKET}/${WASABI_KEY}" --endpoint-url "$WASABI_ENDPOINT" 2>/dev/null; then
-              echo "✅ Browser profile found in Wasabi! Downloading..."
-              PROFILE_EXISTS="true"
+            # `aws s3 ls` exits 1 when the key is missing. Capture stdout
+            # and ignore the exit code so an absent profile doesn't kill
+            # the step (the previous version did `LS_OUTPUT=$(aws ...)`
+            # which under `bash -e` propagated that exit-1 and aborted
+            # the whole job — that's the "exit code 1" you were seeing
+            # right after the "Checking Wasabi..." log line).
+            LS_OUTPUT="$(aws s3 ls "s3://${WASABI_BUCKET}/${WASABI_KEY}" --endpoint-url "$WASABI_ENDPOINT" 2>/dev/null || true)"
 
-              # Download the zip
-              aws s3 cp "s3://${WASABI_BUCKET}/${WASABI_KEY}" "/tmp/${BROWSER_PROFILE_ID}.zip" \
-                --endpoint-url "$WASABI_ENDPOINT"
+            if [ -n "$LS_OUTPUT" ]; then
+              # `aws s3 ls` columns: date time size key
+              EXISTING_BYTES="$(printf '%s\n' "$LS_OUTPUT" | awk 'NR==1 {print $3}')"
+              # Only keep digits; defend against non-numeric output
+              # (error messages, unexpected formats) that would crash
+              # the arithmetic below.
+              case "$EXISTING_BYTES" in
+                ''|*[!0-9]*) EXISTING_BYTES=0 ;;
+              esac
+              EXISTING_MB=$(( EXISTING_BYTES / 1024 / 1024 ))
+              echo "  Existing Wasabi profile size: ${EXISTING_MB} MB (${EXISTING_BYTES} bytes)"
 
-              echo "Extracting browser profile..."
-              unzip -o "/tmp/${BROWSER_PROFILE_ID}.zip" -d "$HOME/browser-profiles/"
-              rm -f "/tmp/${BROWSER_PROFILE_ID}.zip"
-
-              if [ -d "$PROFILE_DIR" ]; then
-                echo "✅ Browser profile extracted to: $PROFILE_DIR"
-                echo "  Profile size: $(du -sh "$PROFILE_DIR" | cut -f1)"
-              else
-                echo "⚠️ Extraction did not produce expected directory, creating fresh profile"
+              if [ "$EXISTING_BYTES" -gt "$MAX_PROFILE_BYTES" ]; then
+                LIMIT_MB=$(( MAX_PROFILE_BYTES / 1024 / 1024 ))
+                echo "⚠️ Existing profile exceeds ${LIMIT_MB} MB limit — deleting from Wasabi and starting fresh (no download)"
+                aws s3 rm "s3://${WASABI_BUCKET}/${WASABI_KEY}" --endpoint-url "$WASABI_ENDPOINT" || echo "⚠️ Wasabi delete failed (ignored)"
                 PROFILE_EXISTS="false"
+              else
+                echo "✅ Browser profile within size limit — downloading..."
+
+                if aws s3 cp "s3://${WASABI_BUCKET}/${WASABI_KEY}" "/tmp/${BROWSER_PROFILE_ID}.zip" --endpoint-url "$WASABI_ENDPOINT"; then
+                  echo "Extracting browser profile..."
+                  if unzip -o "/tmp/${BROWSER_PROFILE_ID}.zip" -d "$HOME/browser-profiles/" >/dev/null; then
+                    rm -f "/tmp/${BROWSER_PROFILE_ID}.zip"
+                    if [ -d "$PROFILE_DIR" ]; then
+                      echo "✅ Browser profile extracted to: $PROFILE_DIR"
+                      echo "  Profile size: $(du -sh "$PROFILE_DIR" 2>/dev/null | cut -f1)"
+                      PROFILE_EXISTS="true"
+                    else
+                      echo "⚠️ Extraction did not produce expected directory, creating fresh profile"
+                      PROFILE_EXISTS="false"
+                    fi
+                  else
+                    echo "⚠️ Unzip failed, creating fresh profile"
+                    rm -f "/tmp/${BROWSER_PROFILE_ID}.zip"
+                    PROFILE_EXISTS="false"
+                  fi
+                else
+                  echo "⚠️ Wasabi download failed, creating fresh profile"
+                  PROFILE_EXISTS="false"
+                fi
               fi
             else
               echo "No existing browser profile found in Wasabi"
@@ -640,9 +660,10 @@ jobs:
             echo "⚠️ Wasabi not configured or no browser_profile_id, using fresh profile"
           fi
 
-          # If no profile exists, create a fresh one
+          # If no usable profile was downloaded, create a fresh one
           if [ "$PROFILE_EXISTS" = "false" ]; then
             echo "Creating fresh browser profile: $PROFILE_DIR"
+            rm -rf "$PROFILE_DIR"
             mkdir -p "$PROFILE_DIR"
             echo "✅ Fresh browser profile directory created"
           fi
@@ -650,6 +671,8 @@ jobs:
           echo "profile_exists=$PROFILE_EXISTS" >> $GITHUB_OUTPUT
           echo "Browser Profile ID: $BROWSER_PROFILE_ID"
           echo "Profile Directory: $PROFILE_DIR"
+          # Always succeed — a fresh profile is a valid outcome.
+          exit 0
 
       - name: Open Chrome on Desktop
         if: steps.config.outputs.vnc_enabled == 'true'
@@ -1225,6 +1248,10 @@ jobs:
         if: always() && steps.config.outputs.cloudflare_enabled == 'true'
         timeout-minutes: 3
         run: |
+          # Cleanup is best-effort: never let a single curl timeout (exit 28)
+          # or other transient failure abort the step. Each command logs its
+          # own warning; the step always exits 0.
+          set +e
           echo "Cleaning up Cloudflare tunnel and DNS record..."
 
           # Stop cloudflared process
@@ -1248,13 +1275,21 @@ jobs:
               DELETE_URL="${DELETE_URL}&browser_profile_id=${BROWSER_PROFILE_ID}"
             fi
 
-            DELETE_TUNNEL_INFO=$(curl -s --connect-timeout 10 --max-time 30 "$DELETE_URL" \
+            # Generous timeouts + automatic retries so a slow AI-management
+            # response never aborts cleanup with curl exit code 28.
+            DELETE_TUNNEL_INFO=$(curl -sS --connect-timeout 10 --max-time 60 \
+              --retry 3 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+              "$DELETE_URL" \
               -X DELETE \
               -H "user-id: ${USER_ID}" \
-              -H "workspace-id: ${WORKSPACE_ID}")
-
-            echo "Tunnel info deletion response:"
-            echo "$DELETE_TUNNEL_INFO"
+              -H "workspace-id: ${WORKSPACE_ID}" 2>&1)
+            CURL_RC=$?
+            if [ $CURL_RC -ne 0 ]; then
+              echo "⚠️ Tunnel info DELETE failed (curl exit=${CURL_RC}); continuing cleanup"
+            else
+              echo "Tunnel info deletion response:"
+              echo "$DELETE_TUNNEL_INFO"
+            fi
           fi
 
           # Delete DNS record
@@ -1305,6 +1340,7 @@ jobs:
           fi
 
           echo "✅ Cloudflare cleanup complete"
+          exit 0
 
       - name: Cleanup Webshare IP Authorization
         if: always() && steps.config.outputs.webshare_enabled == 'true'
@@ -1330,46 +1366,6 @@ jobs:
           fi
 
           echo "✅ Webshare cleanup complete"
-
-      - name: Cleanup Tailscale
-        if: always() && steps.config.outputs.vnc_enabled == 'true'
-        timeout-minutes: 2
-        run: |
-          echo "Removing this device from tailnet..."
-
-          TAILSCALE_TOKEN="${{ steps.config.outputs.tailscale_token }}"
-
-          if [ -n "$TAILSCALE_TOKEN" ]; then
-            # Get this device's Tailscale IPv4 address
-            TARGET_IP=$(tailscale ip -4 2>/dev/null || echo "")
-
-            if [ -n "$TARGET_IP" ]; then
-              echo "This device IP: $TARGET_IP"
-
-              # Find and remove only this device by matching its IP
-              curl -s "https://api.tailscale.com/api/v2/tailnet/-/devices" \
-                --header "Authorization: Basic $TAILSCALE_TOKEN" | \
-                jq -r '.devices[] | "\(.id) \(.addresses[0])"' | \
-                while read id ip; do
-                  if [[ "$ip" == "$TARGET_IP" ]]; then
-                    echo "🗑️ Removing device with IP $ip (ID: $id)"
-                    curl -s -X DELETE "https://api.tailscale.com/api/v2/device/$id" \
-                      --header "Authorization: Basic $TAILSCALE_TOKEN"
-                    echo "✅ Removed device $id"
-                  fi
-                done
-            else
-              echo "⚠️ Could not get Tailscale IP, skipping API cleanup"
-            fi
-          else
-            echo "⚠️ Missing Tailscale token, skipping API cleanup"
-          fi
-
-          echo "Removing local Tailscale..."
-          sudo tailscale down || true
-          sudo apt-get remove -y tailscale || true
-          sudo apt-get autoremove -y || true
-          echo "✅ Tailscale cleanup complete"
 
       - name: Cleanup VNC
         if: always() && steps.config.outputs.vnc_enabled == 'true'
@@ -1447,6 +1443,22 @@ jobs:
           \) -delete 2>/dev/null || true
 
           echo "  Profile size after cleanup: $(du -sh "$PROFILE_DIR" | cut -f1)"
+
+          # Hard size cap. If the profile is still bigger than this after cache
+          # cleanup, treat it as polluted and DON'T upload it back. We also
+          # delete any existing object so the next start does not pull a stale
+          # oversized snapshot. The next run starts fresh with the same UUID.
+          MAX_PROFILE_BYTES=524288000  # 500 MB
+          PROFILE_BYTES=$(du -sb "$PROFILE_DIR" | cut -f1)
+          PROFILE_MB=$((PROFILE_BYTES / 1024 / 1024))
+          echo "  Profile size after cleanup: ${PROFILE_MB} MB (${PROFILE_BYTES} bytes)"
+
+          if [ "$PROFILE_BYTES" -gt "$MAX_PROFILE_BYTES" ] 2>/dev/null; then
+            echo "❌ Profile is still > $((MAX_PROFILE_BYTES / 1024 / 1024)) MB after cleanup — skipping upload"
+            echo "   Deleting any existing Wasabi object so the next session starts fresh: s3://${WASABI_BUCKET}/${WASABI_KEY}"
+            aws s3 rm "s3://${WASABI_BUCKET}/${WASABI_KEY}" --endpoint-url "$WASABI_ENDPOINT" || true
+            exit 0
+          fi
 
           echo "Zipping browser profile: $PROFILE_DIR"
           cd "$HOME/browser-profiles"
